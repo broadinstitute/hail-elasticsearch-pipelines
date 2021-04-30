@@ -4,9 +4,7 @@ import argparse
 import logging
 import os
 import re
-import subprocess
 
-from datetime import datetime
 from elasticsearch import helpers as es_helpers
 from getpass import getpass
 from tqdm import tqdm
@@ -14,10 +12,10 @@ from tqdm import tqdm
 from hail_scripts.shared.elasticsearch_client_v7 import ElasticsearchClient
 from hail_scripts.shared.elasticsearch_utils import ELASTICSEARCH_INDEX
 
+from sv_pipeline.utils.common import get_sample_subset, get_sample_remap, get_es_index_name, CHROM_TO_XPOS_OFFSET
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-GS_SAMPLE_PATH = 'gs://seqr-datasets/v02/GRCh38/RDG_{sample_type}_Broad_Internal/base/projects/{project_guid}/{project_guid}_{file_ext}'
 
 CHR_COL = 'chr'
 START_COL = 'start'
@@ -103,12 +101,6 @@ IN_SILICO_COLS = [VAR_NAME_COL, CALL_COL, IN_SILICO_COL]
 
 QS_BIN_SIZE = 10
 
-CHROMOSOMES = [
-    '1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13', '14', '15', '16', '17', '18', '19', '20', '21',
-    '22', 'X', 'Y', 'M',
-]
-CHROM_TO_XPOS_OFFSET = {chrom: (1 + i)*int(1e9) for i, chrom in enumerate(CHROMOSOMES)}
-
 ES_TYPE_MAP = {
     int: 'integer',
     float: 'double',
@@ -120,56 +112,6 @@ ES_FIELD_TYPE_MAP = {
     'xstart': 'long',
     'xstop': 'long',
 }
-
-
-def _get_gs_samples(project_guid, file_ext, expected_header, sample_type):
-    """
-    Get sample metadata from files in google cloud
-
-    :param project_guid: seqr project identifier
-    :param file_ext: extension for the desired sample file
-    :param expected_header: expected header to validate file
-    :param sample_type: sample type (WES/WGS)
-    :return: parsed data from the sample file as a list of lists
-    """
-    file = GS_SAMPLE_PATH.format(project_guid=project_guid, sample_type=sample_type, file_ext=file_ext)
-    process = subprocess.Popen(
-        'gsutil cat {}'.format(file), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, shell=True)
-    if process.wait() != 0:
-        return None
-    header = next(process.stdout).decode('utf-8')
-    if header.strip() != expected_header:
-        raise Exception('Missing header for sample file, expected "{}" but found {}'.format(
-            expected_header, header))
-    return [line.decode('utf-8').strip().split('\t') for line in process.stdout]
-
-
-def get_sample_subset(project_guid, sample_type):
-    """
-    Get sample id subset for a given project
-
-    :param project_guid: seqr project identifier
-    :param sample_type: sample type (WES/WGS)
-    :return: set of sample ids
-    """
-    subset = _get_gs_samples(project_guid, file_ext='ids.txt', sample_type=sample_type, expected_header='s')
-    if not subset:
-        raise Exception('No sample subset file found')
-    return {row[0] for row in subset}
-
-
-def get_sample_remap(project_guid, sample_type):
-    """
-    Get an optional remapping for sample ids in the given project
-
-    :param project_guid: seqr project identifier
-    :param sample_type: sample type (WES/WGS)
-    :return: dictionary mapping VCF sample ids to seqr sample ids, or None if no mapping available
-    """
-    remap = _get_gs_samples(project_guid, file_ext='remap.tsv', sample_type=sample_type, expected_header='s\tseqr_id')
-    if remap:
-        remap = {row[0]: row[1] for row in remap}
-    return remap
 
 
 def get_field_val(row, col, header_indices, format_kwargs=None):
@@ -402,22 +344,6 @@ def get_es_schema(all_fields, nested_fields):
     for key, val_dict in nested_fields.items():
         schema[key] = {'type': 'nested', 'properties': get_es_schema(val_dict, {})}
     return schema
-
-
-def get_es_index_name(project, meta):
-    """
-    Get the name for the output ES index
-
-    :param project: seqr project identifier
-    :param meta: index metadata
-    :return: index name
-    """
-    return '{project}__structural_variants__{sample_type}__grch{genome_version}__{datestamp}'.format(
-        project=project,
-        sample_type=meta['sampleType'],
-        genome_version=meta['genomeVersion'],
-        datestamp=datetime.today().strftime('%Y%m%d'),
-    ).lower()
 
 
 def export_to_elasticsearch(es_host, es_port, rows, index_name, meta, es_password, num_shards=6):
